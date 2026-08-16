@@ -1,0 +1,27 @@
+# Credenciais e segredos (NUNCA comitar)
+.env
+token.json
+client_secret.json
+
+# Backups e dados privados de e-mails
+backup_*.json
+backup_completo_*.json
+
+# Logs e arquivos de execução
+*.log
+*.err
+auth_*.txt
+
+# Python cache e ambientes virtuais
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# IDEs e sistema operacional
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

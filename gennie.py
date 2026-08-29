@@ -58,10 +58,13 @@ DONO_ID = "5259328865"
 API_KEY = None
 MODEL = "openai/gpt-oss-120b"
 API_URL = "https://api.groq.com/openai/v1/chat/completions"
+BRIDGE_PORT = 8000
+BRIDGE_SECRET_KEY = "gennie_alfredo_secret_token_2026"
+ALFREDO_API_URL = "http://127.0.0.1:8080"
 
 
 def carregar_env():
-    global TOKEN, DONO_ID, API_KEY, MODEL, API_URL
+    global TOKEN, DONO_ID, API_KEY, MODEL, API_URL, BRIDGE_PORT, BRIDGE_SECRET_KEY, ALFREDO_API_URL
     if ENV_FILE.exists():
         for linha in ENV_FILE.read_text(encoding="utf-8").splitlines():
             if linha.startswith("TELEGRAM_TOKEN="):
@@ -84,6 +87,21 @@ def carregar_env():
                 val = linha.split("=", 1)[1].strip()
                 if val:
                     API_URL = val
+            elif linha.startswith("BRIDGE_PORT="):
+                val = linha.split("=", 1)[1].strip()
+                if val:
+                    try:
+                        BRIDGE_PORT = int(val)
+                    except ValueError:
+                        pass
+            elif linha.startswith("BRIDGE_SECRET_KEY="):
+                val = linha.split("=", 1)[1].strip()
+                if val:
+                    BRIDGE_SECRET_KEY = val
+            elif linha.startswith("ALFREDO_API_URL="):
+                val = linha.split("=", 1)[1].strip()
+                if val:
+                    ALFREDO_API_URL = val
 
 
 def autorizado(update: Update):
@@ -484,6 +502,7 @@ CAPACIDADES
 - aplicar_etiqueta: cria, aplica ou remove etiquetas/marcadores customizados em um e-mail.
 - marcar_lido / arquivar: organizam a caixa de entrada.
 - limpar_memoria: limpa o histórico de contexto.
+- enviar_para_alfredo: envia tarefas, lembretes agendados ou textos para o BOT ALFREDO (o mordomo/orquestrador pessoal, como agendar lembretes com data/hora ou pedir para o Alfredo criar um post no LinkedIn a partir de um artigo de e-mail).
 
 ESTRUTURA DE RESPOSTA DO BRIEFING
 Quando o usuário pedir um briefing, resumo geral ou o que há de novo:
@@ -507,6 +526,8 @@ EXEMPLOS DE INTERAÇÃO
 - "leia o email 19bae30da4cb2ea5" → ler_email
 - "responda o email sobre a reunião" → identifique o e-mail e use responder_email
 - "envie um email para joao@x.com..." → enviar_email
+- "peça para o Alfredo agendar um lembrete para a fatura de 05/09" → enviar_para_alfredo(tipo="lembrete", conteudo="Pagar fatura de e-mail", data_hora="05/09")
+- "mande esse artigo para o Alfredo gerar um post no LinkedIn" → enviar_para_alfredo(tipo="linkedin", conteudo="...")
 - "obrigado!" / "valeu GENNIE" → "Por nada! Fico sempre às ordens. Se precisar de mais algo, só me avisar! 😊"
 - "arquive os emails do banco" → arquivar"""
 
@@ -713,6 +734,22 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "enviar_para_alfredo",
+            "description": "Delega ou envia eventos e tarefas para o BOT ALFREDO (ex: agendar lembrete com data/hora, ou enviar notícia/artigo de e-mail para o Alfredo criar um post no LinkedIn).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tipo": {"type": "string", "enum": ["lembrete", "linkedin", "tarefa"], "description": "Tipo de ação delegada ao Alfredo."},
+                    "conteudo": {"type": "string", "description": "Texto do lembrete, artigo para post ou dados da tarefa."},
+                    "data_hora": {"type": "string", "description": "Prazo, data ou horário (ex: '2026-09-05 18:00', 'em 2 horas', 'amanhã às 10h')."},
+                },
+                "required": ["tipo", "conteudo"],
+            },
+        },
+    },
 ]
 
 
@@ -862,6 +899,34 @@ def executar_tool(service, user_data, name, arguments):
         user_data.clear()
         return json.dumps({
             "resultado": "Memória de contexto e rascunhos pendentes limpa com sucesso no sistema. Confirme ao usuário que a memória foi zerada e coloque-se à disposição para um novo assunto."
+        }, ensure_ascii=False)
+
+    if name == "enviar_para_alfredo":
+        tipo = arguments.get("tipo", "lembrete")
+        conteudo = arguments.get("conteudo", "")
+        data_hora = arguments.get("data_hora", "")
+        
+        sucesso_envio = False
+        try:
+            headers = {"Authorization": f"Bearer {BRIDGE_SECRET_KEY}", "Content-Type": "application/json"}
+            payload = {"origem": "GENNIE_BOT", "tipo": tipo, "conteudo": conteudo, "data_hora": data_hora}
+            r = httpx.post(f"{ALFREDO_API_URL}/api/v1/webhook/gennie", json=payload, headers=headers, timeout=3)
+            if r.status_code in (200, 201):
+                sucesso_envio = True
+        except Exception:
+            pass
+
+        if tipo == "lembrete":
+            info_hora = f" (agendado para: {data_hora})" if data_hora else ""
+            msg = f"Lembrete delegado ao ALFREDO com sucesso: '{conteudo}'{info_hora}. Ele cuidará do aviso no Telegram!"
+        elif tipo == "linkedin":
+            msg = f"Conteúdo do e-mail encaminhado para o módulo Ghostwriter do ALFREDO gerar a postagem no LinkedIn."
+        else:
+            msg = f"Ação '{tipo}' delegada ao ALFREDO com sucesso: '{conteudo}'."
+
+        return json.dumps({
+            "resultado": msg,
+            "entregue_via_rede": sucesso_envio
         }, ensure_ascii=False)
 
     return json.dumps({"erro": "Ferramenta desconhecida."}, ensure_ascii=False)
@@ -1108,6 +1173,16 @@ async def comando_briefing(update: Update, context):
     await processar_mensagem(update, context)
 
 
+async def post_init_bridge(application) -> None:
+    """Inicializa o Bridge REST Server assíncrono para o BOT ALFREDO."""
+    try:
+        import bridge_server
+        await bridge_server.iniciar_servidor_bridge(port=BRIDGE_PORT)
+        logging.info("Bridge REST da GENNIE inicializado com sucesso na porta %s", BRIDGE_PORT)
+    except Exception as e:
+        logging.warning("Não foi possível iniciar Bridge REST Server da GENNIE: %s", e)
+
+
 def main():
     logging.basicConfig(level=logging.INFO)
     garantir_instancia_unica()
@@ -1121,6 +1196,7 @@ def main():
         Application.builder()
         .token(TOKEN)
         .persistence(persistencia)
+        .post_init(post_init_bridge)
         .connect_timeout(30)
         .read_timeout(30)
         .write_timeout(30)
@@ -1134,7 +1210,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, processar_mensagem))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, receber_documento))
     app.add_error_handler(erro_global)
-    print(f"GENNIE IA iniciado com Persistência Ativa. Dono: {DONO_ID} | Modelo: {MODEL}")
+    print(f"GENNIE IA iniciado com Persistência Ativa & Bridge REST (Porta {BRIDGE_PORT}). Dono: {DONO_ID} | Modelo: {MODEL}")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 

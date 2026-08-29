@@ -200,13 +200,89 @@ class ValidadorBot:
             else:
                 self.log_resultado("Ferramentas", "Trava de Segurança (enviar_email)", False, f"Resposta inesperada: {res_draft}")
 
+            # 4.4 Teste de Montagem de E-mail com Anexo
+            user_data_anexo = {
+                "anexo_pendente": {
+                    "nome": "relatorio_teste.pdf",
+                    "bytes": b"%PDF-1.4 teste",
+                    "tamanho": 14
+                }
+            }
+            res_draft_anexo = gennie.executar_tool(
+                self.gmail_service,
+                user_data_anexo,
+                "enviar_email",
+                {"dest": "financeiro@empresa.com", "assunto": "Relatório", "corpo": "Segue relatório anexo."}
+            )
+            draft_anexo = user_data_anexo.get("draft", {})
+            if draft_anexo.get("anexo_nome") == "relatorio_teste.pdf" and draft_anexo.get("anexo_bytes") == b"%PDF-1.4 teste":
+                self.log_resultado("Ferramentas", "Gestão de Anexos (Prévia Multipart)", True, "Anexo capturado e acoplado ao rascunho com sucesso")
+            else:
+                self.log_resultado("Ferramentas", "Gestão de Anexos (Prévia Multipart)", False, "Falha ao acoplar anexo ao rascunho")
+
+            # 4.5 Teste de Destaque com Estrela (STARRED)
+            if emails:
+                primeiro_id = emails[0]["id"]
+                res_star = gennie.executar_tool(
+                    self.gmail_service,
+                    {},
+                    "destacar_email",
+                    {"msg_id": primeiro_id, "destacar": True}
+                )
+                if "estrela" in res_star:
+                    self.log_resultado("Ferramentas", "destacar_email() (STARRED)", True, f"E-mail {primeiro_id} destacado com estrela com sucesso")
+                else:
+                    self.log_resultado("Ferramentas", "destacar_email() (STARRED)", False, f"Resposta inesperada: {res_star}")
+
+            # 4.6 Teste de Etiquetas / Marcadores Customizados
+            if emails:
+                primeiro_id = emails[0]["id"]
+                res_label = gennie.executar_tool(
+                    self.gmail_service,
+                    {},
+                    "aplicar_etiqueta",
+                    {"msg_id": primeiro_id, "nome_etiqueta": "GENNIE_TESTE"}
+                )
+                if "aplicada com sucesso" in res_label:
+                    self.log_resultado("Ferramentas", "aplicar_etiqueta() (Marcadores)", True, "Marcador 'GENNIE_TESTE' criado/aplicado com sucesso")
+                else:
+                    self.log_resultado("Ferramentas", "aplicar_etiqueta() (Marcadores)", False, f"Resposta inesperada: {res_label}")
+
+            # 4.7 Teste de Coleta em Lote para Briefing
+            res_briefing = gennie.executar_tool(
+                self.gmail_service,
+                {},
+                "gerar_briefing",
+                {"query": "in:inbox", "max_emails": 3}
+            )
+            dados_briefing = json.loads(res_briefing)
+            if "total_analisados" in dados_briefing:
+                self.log_resultado("Ferramentas", "gerar_briefing() (Lote IA)", True, f"{dados_briefing['total_analisados']} e-mail(s) coletados e preparados para briefing")
+            else:
+                self.log_resultado("Ferramentas", "gerar_briefing() (Lote IA)", False, f"Resposta inesperada: {res_briefing}")
+
+            # 4.8 Teste de Resumo de Thread
+            if emails:
+                primeiro_id = emails[0]["id"]
+                res_thread = gennie.executar_tool(
+                    self.gmail_service,
+                    {},
+                    "resumir_thread",
+                    {"msg_id": primeiro_id}
+                )
+                dados_thread = json.loads(res_thread)
+                if "total_mensagens" in dados_thread:
+                    self.log_resultado("Ferramentas", "resumir_thread() (Histórico)", True, f"Thread com {dados_thread['total_mensagens']} mensagem(ns) obtida com sucesso")
+                else:
+                    self.log_resultado("Ferramentas", "resumir_thread() (Histórico)", False, f"Resposta inesperada: {res_thread}")
+
         except Exception as e:
             self.log_resultado("Ferramentas", "Execução de Tools", False, f"Erro ao testar ferramentas: {e}")
 
     def validar_llm_e_function_calling(self):
         print(f"\n{BOLD}{CYAN}=== 5. Validação do Modelo de IA & Function Calling ==={RESET}")
         api_key = self.env_vars.get("DEEPSEEK_API_KEY")
-        model = self.env_vars.get("DEEPSEEK_MODEL", "llama-3.3-70b-versatile")
+        model = self.env_vars.get("DEEPSEEK_MODEL", "openai/gpt-oss-120b")
         api_url = self.env_vars.get("DEEPSEEK_URL", "https://api.groq.com/openai/v1/chat/completions")
 
         if not api_key:

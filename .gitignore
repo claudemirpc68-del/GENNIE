@@ -3,9 +3,10 @@
 token.json
 client_secret.json
 
-# Backups e dados privados de e-mails
+# Backups e dados privados de e-mails / memória
 backup_*.json
 backup_completo_*.json
+*.pickle
 
 # Logs e arquivos de execução
 *.log

@@ -1,10 +1,28 @@
 import base64
+import io
 import json
 import logging
+import mimetypes
 import re
+import socket
 import sys
+from email import encoders
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
+
+_lock_socket = None
+
+def garantir_instancia_unica():
+    global _lock_socket
+    _lock_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        _lock_socket.bind(("127.0.0.1", 49876))
+    except OSError:
+        print("[!] ATENÇÃO: Outra instância do GENNIE Bot já está em execução no sistema. Encerrando processo duplicado.")
+        logging.warning("Tentativa de iniciar instância duplicada bloqueada. Porta 49876 já em uso.")
+        sys.exit(0)
 
 # Garante suporte a UTF-8 no terminal Windows
 if sys.stdout.encoding != "utf-8":
@@ -20,12 +38,13 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, PicklePersistence, filters
 
 BASE = Path(__file__).resolve().parent
 ENV_FILE = BASE / ".env"
 CLIENT_SECRET = BASE / "client_secret.json"
 TOKEN_FILE = BASE / "token.json"
+MEMORIA_FILE = BASE / "gennie_memoria.pickle"
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.send",
@@ -37,7 +56,7 @@ CONTA = "claudemirpc68@gmail.com"
 TOKEN = None
 DONO_ID = "5259328865"
 API_KEY = None
-MODEL = "llama-3.3-70b-versatile"
+MODEL = "openai/gpt-oss-120b"
 API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 
@@ -103,36 +122,99 @@ def listar_emails(service, query="in:inbox", max_results=5):
             metadataHeaders=["From", "Subject", "Date"],
         ).execute()
         headers = {h["name"].lower(): h["value"] for h in det.get("payload", {}).get("headers", [])}
-        nao_lido = "UNREAD" in det.get("labelIds", [])
+        labels = det.get("labelIds", [])
+        nao_lido = "UNREAD" in labels
+        destacado = "STARRED" in labels
         emails.append({
             "id": det["id"],
             "from": headers.get("from", "?"),
             "subject": headers.get("subject", "(sem assunto)"),
             "date": headers.get("date", ""),
             "unread": nao_lido,
+            "starred": destacado,
+            "labels": labels,
         })
     return emails
+
+
+def extrair_corpo_e_anexos(payload):
+    corpo = ""
+    anexos = []
+
+    def processar_parte(parte):
+        nonlocal corpo
+        mime = parte.get("mimeType", "")
+        filename = parte.get("filename", "")
+        body = parte.get("body", {})
+
+        if filename and body.get("attachmentId"):
+            anexos.append({
+                "filename": filename,
+                "mimeType": mime,
+                "size": body.get("size", 0),
+                "attachmentId": body.get("attachmentId"),
+            })
+        elif mime == "text/plain" and body.get("data") and not corpo:
+            try:
+                corpo = base64.urlsafe_b64decode(body["data"]).decode("utf-8", errors="replace")
+            except Exception:
+                pass
+
+        for subparte in parte.get("parts", []):
+            processar_parte(subparte)
+
+    if payload.get("body", {}).get("data") and payload.get("mimeType") == "text/plain":
+        try:
+            corpo = base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8", errors="replace")
+        except Exception:
+            pass
+
+    for p in payload.get("parts", []):
+        processar_parte(p)
+
+    return corpo, anexos
 
 
 def ler_email(service, msg_id):
     det = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
     payload = det.get("payload", {})
     headers = {h["name"].lower(): h["value"] for h in payload.get("headers", [])}
-    corpo = ""
-    if payload.get("body", {}).get("data"):
-        corpo = base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8", errors="replace")
-    else:
-        for p in payload.get("parts", []):
-            if p.get("mimeType") == "text/plain" and p.get("body", {}).get("data"):
-                corpo = base64.urlsafe_b64decode(p["body"]["data"]).decode("utf-8", errors="replace")
-                break
+    corpo, anexos = extrair_corpo_e_anexos(payload)
+    
+    anexos_formatados = []
+    for a in anexos:
+        tam_kb = round(a["size"] / 1024, 1)
+        anexos_formatados.append(f"{a['filename']} ({tam_kb} KB)")
+        
     return {
         "id": det["id"],
         "from": headers.get("from", "?"),
         "subject": headers.get("subject", "(sem assunto)"),
         "date": headers.get("date", ""),
         "body": corpo.strip()[:5000],
+        "anexos": anexos_formatados,
     }
+
+
+def obter_anexo_por_nome(service, msg_id, nome_arquivo=""):
+    det = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
+    _, anexos = extrair_corpo_e_anexos(det.get("payload", {}))
+    if not anexos:
+        return None, "Nenhum anexo encontrado neste e-mail."
+    alvo = None
+    if nome_arquivo:
+        for a in anexos:
+            if nome_arquivo.lower() in a["filename"].lower():
+                alvo = a
+                break
+    if not alvo:
+        alvo = anexos[0]
+    
+    att = service.users().messages().attachments().get(
+        userId="me", messageId=msg_id, id=alvo["attachmentId"]
+    ).execute()
+    dados = base64.urlsafe_b64decode(att.get("data", ""))
+    return {"filename": alvo["filename"], "mimeType": alvo["mimeType"], "data": dados}, None
 
 
 def marcar_lido(service, msg_id):
@@ -147,24 +229,179 @@ def arquivar(service, msg_id):
     ).execute()
 
 
+def destacar_email(service, msg_id, destacar=True):
+    body = {"addLabelIds": ["STARRED"]} if destacar else {"removeLabelIds": ["STARRED"]}
+    service.users().messages().modify(userId="me", id=msg_id, body=body).execute()
+
+
+def lixeira_email(service, msg_id, enviar_lixeira=True):
+    if enviar_lixeira:
+        service.users().messages().trash(userId="me", id=msg_id).execute()
+    else:
+        service.users().messages().untrash(userId="me", id=msg_id).execute()
+
+
+def marcar_spam(service, msg_id):
+    service.users().messages().modify(
+        userId="me", id=msg_id, body={"addLabelIds": ["SPAM"], "removeLabelIds": ["INBOX"]}
+    ).execute()
+
+
+def obter_ou_criar_etiqueta(service, nome_etiqueta):
+    labels_res = service.users().labels().list(userId="me").execute()
+    labels = labels_res.get("labels", [])
+    for l in labels:
+        if l["name"].lower() == nome_etiqueta.lower():
+            return l["id"], l["name"]
+    nova = service.users().labels().create(
+        userId="me",
+        body={
+            "name": nome_etiqueta,
+            "labelListVisibility": "labelShow",
+            "messageListVisibility": "show",
+        }
+    ).execute()
+    return nova["id"], nova["name"]
+
+
+def aplicar_etiqueta(service, msg_id, nome_etiqueta, remover=False):
+    label_id, label_nome = obter_ou_criar_etiqueta(service, nome_etiqueta)
+    if remover:
+        service.users().messages().modify(
+            userId="me", id=msg_id, body={"removeLabelIds": [label_id]}
+        ).execute()
+        return f"Etiqueta '{label_nome}' removida do e-mail {msg_id}."
+    else:
+        service.users().messages().modify(
+            userId="me", id=msg_id, body={"addLabelIds": [label_id]}
+        ).execute()
+        return f"Etiqueta '{label_nome}' aplicada com sucesso ao e-mail {msg_id}."
+
+
+def obter_lote_para_briefing(service, max_emails=8, query="in:inbox is:unread"):
+    resultado = service.users().messages().list(
+        userId="me", q=query, maxResults=max_emails
+    ).execute()
+    msgs = resultado.get("messages", [])
+    
+    # Se não encontrar e-mails não lidos, busca os mais recentes da Inbox
+    if not msgs and "is:unread" in query:
+        resultado = service.users().messages().list(
+            userId="me", q="in:inbox", maxResults=max_emails
+        ).execute()
+        msgs = resultado.get("messages", [])
+        
+    emails_lote = []
+    for m in msgs:
+        det = service.users().messages().get(
+            userId="me", id=m["id"], format="full"
+        ).execute()
+        payload = det.get("payload", {})
+        headers = {h["name"].lower(): h["value"] for h in payload.get("headers", [])}
+        labels = det.get("labelIds", [])
+        corpo, anexos = extrair_corpo_e_anexos(payload)
+        
+        snippet = det.get("snippet", "")
+        corpo_resumo = (corpo or snippet or "").strip()[:600]
+        
+        emails_lote.append({
+            "id": det["id"],
+            "threadId": det.get("threadId"),
+            "from": headers.get("from", "?"),
+            "subject": headers.get("subject", "(sem assunto)"),
+            "date": headers.get("date", ""),
+            "unread": "UNREAD" in labels,
+            "starred": "STARRED" in labels,
+            "tem_anexos": len(anexos) > 0,
+            "qtd_anexos": len(anexos),
+            "trecho": corpo_resumo,
+        })
+    return emails_lote
+
+
+def obter_thread_completa(service, msg_id):
+    det = service.users().messages().get(userId="me", id=msg_id, format="minimal").execute()
+    thread_id = det.get("threadId", msg_id)
+    
+    thread = service.users().threads().get(userId="me", id=thread_id, format="full").execute()
+    mensagens = thread.get("messages", [])
+    
+    historico = []
+    for m in mensagens:
+        payload = m.get("payload", {})
+        headers = {h["name"].lower(): h["value"] for h in payload.get("headers", [])}
+        corpo, anexos = extrair_corpo_e_anexos(payload)
+        historico.append({
+            "id": m["id"],
+            "from": headers.get("from", "?"),
+            "date": headers.get("date", ""),
+            "subject": headers.get("subject", ""),
+            "corpo": (corpo or "").strip()[:2000],
+            "qtd_anexos": len(anexos),
+        })
+    return {
+        "threadId": thread_id,
+        "total_mensagens": len(historico),
+        "mensagens": historico,
+    }
+
+
 def formatar_corpo_com_assinatura(corpo: str) -> str:
     texto = (corpo or "").strip()
-    if ASSINATURA.lower() in texto.lower()[-len(ASSINATURA)-40:]:
-        return texto
-    return f"{texto}\n\n{ASSINATURA}"
+    if not texto:
+        return ASSINATURA
+    primeiro_nome = ASSINATURA.split()[0]
+    padroes_nome = [
+        re.escape(ASSINATURA),
+        re.escape(primeiro_nome),
+        r"Claudemir\s+Pedroso",
+        r"Claudemir\s+Cubas",
+    ]
+    padrao_re = r"(?i)(?:[\r\n\s]+)(?:" + "|".join(padroes_nome) + r")\s*$"
+    texto_limpo = re.sub(padrao_re, "", texto).strip()
+    
+    despedidas = [
+        "atenciosamente,", "atenciosamente", 
+        "cordialmente,", "cordialmente", 
+        "abraços,", "abraços", "abracos,", "abracos", 
+        "obrigado,", "grato,", "respeitosamente,"
+    ]
+    linhas = texto_limpo.splitlines()
+    ultima_linha = linhas[-1].strip().lower() if linhas else ""
+    if any(ultima_linha == d for d in despedidas) or ultima_linha.endswith(","):
+        return f"{texto_limpo}\n{ASSINATURA}"
+    return f"{texto_limpo}\n\n{ASSINATURA}"
 
 
-def enviar_email(service, dest, assunto, corpo):
+def enviar_email(service, dest, assunto, corpo, anexo_bytes=None, anexo_nome=None):
     corpo_completo = formatar_corpo_com_assinatura(corpo)
-    m = MIMEText(corpo_completo, "plain", "utf-8")
-    m["To"] = dest
-    m["From"] = CONTA
-    m["Subject"] = assunto
-    raw = base64.urlsafe_b64encode(m.as_bytes()).decode()
+    if anexo_bytes and anexo_nome:
+        msg = MIMEMultipart()
+        msg["To"] = dest
+        msg["From"] = CONTA
+        msg["Subject"] = assunto
+        msg.attach(MIMEText(corpo_completo, "plain", "utf-8"))
+        
+        tipo_mime, _ = mimetypes.guess_type(anexo_nome)
+        tipo_mime = tipo_mime or "application/octet-stream"
+        main_type, sub_type = tipo_mime.split("/", 1) if "/" in tipo_mime else ("application", "octet-stream")
+        
+        parte_anexo = MIMEBase(main_type, sub_type)
+        parte_anexo.set_payload(anexo_bytes)
+        encoders.encode_base64(parte_anexo)
+        parte_anexo.add_header("Content-Disposition", f'attachment; filename="{anexo_nome}"')
+        msg.attach(parte_anexo)
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    else:
+        m = MIMEText(corpo_completo, "plain", "utf-8")
+        m["To"] = dest
+        m["From"] = CONTA
+        m["Subject"] = assunto
+        raw = base64.urlsafe_b64encode(m.as_bytes()).decode()
     service.users().messages().send(userId="me", body={"raw": raw}).execute()
 
 
-def responder_email(service, msg_id, corpo):
+def responder_email(service, msg_id, corpo, anexo_bytes=None, anexo_nome=None):
     det = service.users().messages().get(
         userId="me", id=msg_id, format="metadata",
         metadataHeaders=["From", "Subject", "References", "Message-ID"],
@@ -180,13 +417,34 @@ def responder_email(service, msg_id, corpo):
     if not assunto.lower().startswith("re:"):
         assunto = f"Re: {assunto}"
     corpo_completo = formatar_corpo_com_assinatura(corpo)
-    m = MIMEText(corpo_completo, "plain", "utf-8")
-    m["To"] = dest
-    m["From"] = CONTA
-    m["Subject"] = assunto
-    m["In-Reply-To"] = msgid
-    m["References"] = refs
-    raw = base64.urlsafe_b64encode(m.as_bytes()).decode()
+    
+    if anexo_bytes and anexo_nome:
+        msg = MIMEMultipart()
+        msg["To"] = dest
+        msg["From"] = CONTA
+        msg["Subject"] = assunto
+        msg["In-Reply-To"] = msgid
+        msg["References"] = refs
+        msg.attach(MIMEText(corpo_completo, "plain", "utf-8"))
+        
+        tipo_mime, _ = mimetypes.guess_type(anexo_nome)
+        tipo_mime = tipo_mime or "application/octet-stream"
+        main_type, sub_type = tipo_mime.split("/", 1) if "/" in tipo_mime else ("application", "octet-stream")
+        
+        parte_anexo = MIMEBase(main_type, sub_type)
+        parte_anexo.set_payload(anexo_bytes)
+        encoders.encode_base64(parte_anexo)
+        parte_anexo.add_header("Content-Disposition", f'attachment; filename="{anexo_nome}"')
+        msg.attach(parte_anexo)
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+    else:
+        m = MIMEText(corpo_completo, "plain", "utf-8")
+        m["To"] = dest
+        m["From"] = CONTA
+        m["Subject"] = assunto
+        m["In-Reply-To"] = msgid
+        m["References"] = refs
+        raw = base64.urlsafe_b64encode(m.as_bytes()).decode()
     service.users().messages().send(userId="me", body={"raw": raw}).execute()
     return dest, assunto
 
@@ -196,7 +454,7 @@ SYSTEM_PROMPT = f"""Você é o GENNIE, um assistente pessoal inteligente de e-ma
 IDENTIDADE & PERSONALIDADE
 - Nome: GENNIE (inspirado no gênio dos filmes — seja simpático, ágil, prestativo, bem-humorado e caloroso).
 - Você gerencia a conta de e-mail: {CONTA}
-- Assinatura oficial: {ASSINATURA} (o sistema anexa a assinatura automaticamente no final de cada envio; logo, você NÃO precisa repetir o nome completo dentro do argumento 'corpo').
+- Assinatura oficial: {ASSINATURA} (o sistema anexa a assinatura oficial automaticamente no final de cada envio. Ao redigir o corpo de um e-mail ou resposta, termine apenas com a mensagem ou saudação como 'Atenciosamente,' ou 'Cordialmente,', SEM adicionar nomes ou assinaturas manuais para evitar duplicações).
 
 COMUNICAÇÃO & CONTINUIDADE DE DIÁLOGO
 - Responda sempre em português do Brasil (pt-BR) de forma humana, fluida, educada e carismática.
@@ -213,15 +471,39 @@ REGRAS OBRIGATÓRIAS
 5. Se o usuário pedir algo fora das suas capacidades, explique com educação e bom humor.
 
 CAPACIDADES
-- listar_emails: busca e-mails (caixa de entrada, não lidos, por remetente/assunto).
-- ler_email: lê o conteúdo completo de um e-mail pelo ID.
-- enviar_email: cria um e-mail novo (exige aprovação antes do envio).
+- listar_emails: busca e-mails (caixa de entrada, não lidos, por remetente/assunto, com anexos ou estrelas).
+- ler_email: lê o conteúdo completo de um e-mail pelo ID e lista os anexos disponíveis.
+- gerar_briefing: analisa os e-mails recentes/não lidos em lote e gera um relatório executivo consolidado (panorama geral, urgências/prazos, informativos e sugestões de ação).
+- resumir_thread: lê o histórico completo de trocas de mensagens de uma conversa pelo ID e sintetiza o contexto, decisões e ações pendentes.
+- baixar_anexo: faz o download de um anexo de um e-mail específico e envia o arquivo diretamente para o usuário no Telegram.
+- enviar_email: cria um e-mail novo (com ou sem arquivo anexo, exigindo aprovação antes do envio).
 - responder_email: responde a um e-mail existente (exige aprovação antes do envio).
+- destacar_email: marca ou desmarca um e-mail com estrela (destaque).
+- lixeira_email: move um e-mail para a lixeira do Gmail ou restaura-o.
+- marcar_spam: move um e-mail indesejado para a pasta de Spam.
+- aplicar_etiqueta: cria, aplica ou remove etiquetas/marcadores customizados em um e-mail.
 - marcar_lido / arquivar: organizam a caixa de entrada.
+- limpar_memoria: limpa o histórico de contexto.
+
+ESTRUTURA DE RESPOSTA DO BRIEFING
+Quando o usuário pedir um briefing, resumo geral ou o que há de novo:
+- Utilize a ferramenta 'gerar_briefing'.
+- Apresente um resumo executivo bonito, claro e estruturado com emojis:
+  📊 **Panorama Geral**
+  🔥 **Urgências, Prazos & Ações Requeridas** (destaque remetente e o que precisa ser feito)
+  ℹ️ **Informativos & Notificações** (boletins, avisos)
+  💡 **Próximos Passos Sugeridos** (ex: "Quer que eu responda o e-mail de fulano?" ou "Posso arquivar as mensagens lidas?")
 
 EXEMPLOS DE INTERAÇÃO
 - "oi" / "olá" → "Olá! Tudo bem? Como posso te ajudar com seus e-mails hoje?"
-- "veja meus emails" / "tem email novo?" → listar_emails
+- "me dê um briefing dos meus emails" / "/briefing" → gerar_briefing
+- "resuma a conversa do email 1a04e" → resumir_thread
+- "veja meus emails com anexo" → listar_emails(query="has:attachment")
+- "destaque o email 1a04e com estrela" → destacar_email
+- "mova o email de promoção para a lixeira" → lixeira_email
+- "marque este email como spam" → marcar_spam
+- "coloque a etiqueta Finanças no email 1a04e" → aplicar_etiqueta
+- "baixe o anexo do email 1a04e..." → baixar_anexo
 - "leia o email 19bae30da4cb2ea5" → ler_email
 - "responda o email sobre a reunião" → identifique o e-mail e use responder_email
 - "envie um email para joao@x.com..." → enviar_email
@@ -234,11 +516,11 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "listar_emails",
-            "description": "Lista e-mails da conta (por padrão a caixa de entrada). Use para 'veja meus emails', 'tem email novo?', 'emails não lidos'.",
+            "description": "Lista e-mails da conta (por padrão a caixa de entrada). Suporta filtros como 'in:inbox', 'has:attachment', 'is:starred', 'filename:pdf', 'from:alguem@x.com'.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Filtro Gmail, ex: 'in:inbox', 'in:inbox is:unread', 'from:alguem@x.com', 'subject:algo'."},
+                    "query": {"type": "string", "description": "Filtro Gmail, ex: 'in:inbox', 'has:attachment', 'is:starred', 'is:unread', 'from:...', 'subject:...'."},
                     "max_results": {"type": "integer", "description": "Quantidade máxima (padrão 5)."},
                 },
             },
@@ -247,12 +529,55 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "ler_email",
-            "description": "Lê o conteúdo completo de um e-mail pelo ID. Use o ID exibido na listagem.",
+            "name": "gerar_briefing",
+            "description": "Coleta múltiplos e-mails recentes ou não lidos da caixa de entrada em lote para gerar um briefing executivo consolidado com prioridades, prazos e ações.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Filtro de busca (padrão: 'in:inbox is:unread' ou 'in:inbox')."},
+                    "max_emails": {"type": "integer", "description": "Quantidade de e-mails para consolidar no briefing (padrão 8)."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "resumir_thread",
+            "description": "Obtém a thread completa de trocas de mensagens de uma conversa ou e-mail específico pelo ID para sintetizar o histórico e decisões.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "msg_id": {"type": "string", "description": "ID do e-mail."},
+                },
+                "required": ["msg_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ler_email",
+            "description": "Lê o conteúdo completo de um e-mail pelo ID e retorna o corpo e a lista de anexos disponíveis.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "msg_id": {"type": "string", "description": "ID do e-mail."},
+                },
+                "required": ["msg_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "baixar_anexo",
+            "description": "Baixa um anexo do Gmail e envia o arquivo diretamente para o usuário no Telegram.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "msg_id": {"type": "string", "description": "ID do e-mail que contém o anexo."},
+                    "nome_arquivo": {"type": "string", "description": "Nome ou parte do nome do arquivo desejado (opcional se houver apenas um anexo)."},
                 },
                 "required": ["msg_id"],
             },
@@ -292,6 +617,66 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "destacar_email",
+            "description": "Adiciona ou remove a estrela (destaque) de um e-mail no Gmail.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "msg_id": {"type": "string", "description": "ID do e-mail."},
+                    "destacar": {"type": "boolean", "description": "True para destacar com estrela, False para remover."},
+                },
+                "required": ["msg_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "lixeira_email",
+            "description": "Move um e-mail para a lixeira do Gmail ou o restaura.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "msg_id": {"type": "string", "description": "ID do e-mail."},
+                    "enviar_lixeira": {"type": "boolean", "description": "True para mover para lixeira, False para restaurar."},
+                },
+                "required": ["msg_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "marcar_spam",
+            "description": "Move um e-mail para a pasta de Spam do Gmail.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "msg_id": {"type": "string", "description": "ID do e-mail."},
+                },
+                "required": ["msg_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "aplicar_etiqueta",
+            "description": "Cria, aplica ou remove uma etiqueta customizada em um e-mail no Gmail.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "msg_id": {"type": "string", "description": "ID do e-mail."},
+                    "nome_etiqueta": {"type": "string", "description": "Nome da etiqueta (ex: 'Finanças', 'Projetos', 'Trabalho')."},
+                    "remover": {"type": "boolean", "description": "True para remover a etiqueta, False para aplicar."},
+                },
+                "required": ["msg_id", "nome_etiqueta"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "marcar_lido",
             "description": "Marca um e-mail como lido.",
             "parameters": {
@@ -314,6 +699,17 @@ TOOLS = [
                     "msg_id": {"type": "string"},
                 },
                 "required": ["msg_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "limpar_memoria",
+            "description": "Limpa e reseta a memória de conversas e quaisquer rascunhos pendentes. Use sempre que o usuário pedir para limpar a memória, apagar o histórico, esquecer a conversa ou resetar.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
             },
         },
     },
@@ -350,44 +746,109 @@ def executar_tool(service, user_data, name, arguments):
             return json.dumps({"resultado": "Nenhum e-mail encontrado."}, ensure_ascii=False)
         linhas = []
         for e in emails:
-            marca = "🔴 NAO LIDO" if e["unread"] else "lido"
-            linhas.append(f"ID: {e['id']} | {marca}\nDe: {e['from']}\nAssunto: {e['subject']}\nData: {e['date']}")
+            marcas = []
+            if e.get("unread"):
+                marcas.append("🔴 NÃO LIDO")
+            if e.get("starred"):
+                marcas.append("⭐ DESTACADO")
+            tag_status = f" [{', '.join(marcas)}]" if marcas else ""
+            linhas.append(f"ID: {e['id']}{tag_status}\nDe: {e['from']}\nAssunto: {e['subject']}\nData: {e['date']}")
         return json.dumps({"emails": linhas}, ensure_ascii=False)
+
+    if name == "gerar_briefing":
+        query = arguments.get("query", "in:inbox is:unread")
+        max_emails = int(arguments.get("max_emails", 8))
+        lote = obter_lote_para_briefing(service, max_emails=max_emails, query=query)
+        if not lote:
+            return json.dumps({"resultado": "Nenhum e-mail recente encontrado para o briefing."}, ensure_ascii=False)
+        return json.dumps({"total_analisados": len(lote), "emails": lote}, ensure_ascii=False)
+
+    if name == "resumir_thread":
+        thread_info = obter_thread_completa(service, arguments["msg_id"])
+        return json.dumps(thread_info, ensure_ascii=False)
 
     if name == "ler_email":
         email = ler_email(service, arguments["msg_id"])
         return json.dumps(email, ensure_ascii=False)
 
+    if name == "baixar_anexo":
+        anexo, erro = obter_anexo_por_nome(service, arguments["msg_id"], arguments.get("nome_arquivo", ""))
+        if erro or not anexo:
+            return json.dumps({"erro": erro or "Não foi possível obter o anexo."}, ensure_ascii=False)
+        user_data["anexo_para_enviar_tg"] = anexo
+        return json.dumps({
+            "resultado": f"Anexo '{anexo['filename']}' baixado com sucesso do Gmail e pronto para envio ao usuário no Telegram.",
+            "filename": anexo["filename"],
+            "mimeType": anexo["mimeType"]
+        }, ensure_ascii=False)
+
     if name == "enviar_email":
         corpo_final = formatar_corpo_com_assinatura(arguments.get("corpo", ""))
+        anexo_pendente = user_data.get("anexo_pendente")
+        anexo_nome = anexo_pendente["nome"] if anexo_pendente else None
+        anexo_bytes = anexo_pendente["bytes"] if anexo_pendente else None
+        
         user_data["draft"] = {
             "acao": "enviar",
             "dest": arguments["dest"],
             "assunto": arguments.get("assunto", ""),
             "corpo": corpo_final,
+            "anexo_nome": anexo_nome,
+            "anexo_bytes": anexo_bytes,
         }
+        
+        info_anexo = f"\n📎 Anexo: {anexo_nome} ({round(anexo_pendente['tamanho']/1024, 1)} KB)" if anexo_pendente else ""
         return json.dumps({
             "acao": "PEDIR_APROVACAO",
             "msg": (
-                f"Prévia do e-mail:\nPara: {arguments['dest']}\nAssunto: {arguments.get('assunto','')}\n\n"
+                f"Prévia do e-mail:\nPara: {arguments['dest']}\nAssunto: {arguments.get('assunto','')}{info_anexo}\n\n"
                 f"Mensagem:\n{corpo_final}\n\nResponda 'sim' para enviar ou 'cancelar'."
             ),
         }, ensure_ascii=False)
 
     if name == "responder_email":
         corpo_final = formatar_corpo_com_assinatura(arguments.get("corpo", ""))
+        anexo_pendente = user_data.get("anexo_pendente")
+        anexo_nome = anexo_pendente["nome"] if anexo_pendente else None
+        anexo_bytes = anexo_pendente["bytes"] if anexo_pendente else None
+        
         user_data["draft"] = {
             "acao": "responder",
             "msg_id": arguments["msg_id"],
             "corpo": corpo_final,
+            "anexo_nome": anexo_nome,
+            "anexo_bytes": anexo_bytes,
         }
+        
+        info_anexo = f"\n📎 Anexo: {anexo_nome} ({round(anexo_pendente['tamanho']/1024, 1)} KB)" if anexo_pendente else ""
         return json.dumps({
             "acao": "PEDIR_APROVACAO",
             "msg": (
-                f"Prévia da resposta ao e-mail {arguments['msg_id']}:\n\n{corpo_final}\n\n"
+                f"Prévia da resposta ao e-mail {arguments['msg_id']}:{info_anexo}\n\n{corpo_final}\n\n"
                 f"Responda 'sim' para enviar ou 'cancelar'."
             ),
         }, ensure_ascii=False)
+
+    if name == "destacar_email":
+        destacar = arguments.get("destacar", True)
+        destacar_email(service, arguments["msg_id"], destacar=destacar)
+        status_txt = "destacado com estrela ⭐" if destacar else "com estrela removida"
+        return json.dumps({"resultado": f"E-mail {arguments['msg_id']} {status_txt} com sucesso."}, ensure_ascii=False)
+
+    if name == "lixeira_email":
+        enviar = arguments.get("enviar_lixeira", True)
+        lixeira_email(service, arguments["msg_id"], enviar_lixeira=enviar)
+        status_txt = "movido para a Lixeira 🗑️" if enviar else "restaurado da Lixeira"
+        return json.dumps({"resultado": f"E-mail {arguments['msg_id']} {status_txt} com sucesso."}, ensure_ascii=False)
+
+    if name == "marcar_spam":
+        marcar_spam(service, arguments["msg_id"])
+        return json.dumps({"resultado": f"E-mail {arguments['msg_id']} marcado como SPAM 🚫 e removido da caixa de entrada."}, ensure_ascii=False)
+
+    if name == "aplicar_etiqueta":
+        remover = arguments.get("remover", False)
+        res_etiqueta = aplicar_etiqueta(service, arguments["msg_id"], arguments["nome_etiqueta"], remover=remover)
+        return json.dumps({"resultado": res_etiqueta}, ensure_ascii=False)
 
     if name == "marcar_lido":
         marcar_lido(service, arguments["msg_id"])
@@ -397,16 +858,26 @@ def executar_tool(service, user_data, name, arguments):
         arquivar(service, arguments["msg_id"])
         return json.dumps({"resultado": f"E-mail {arguments['msg_id']} arquivado."}, ensure_ascii=False)
 
+    if name == "limpar_memoria":
+        user_data.clear()
+        return json.dumps({
+            "resultado": "Memória de contexto e rascunhos pendentes limpa com sucesso no sistema. Confirme ao usuário que a memória foi zerada e coloque-se à disposição para um novo assunto."
+        }, ensure_ascii=False)
+
     return json.dumps({"erro": "Ferramenta desconhecida."}, ensure_ascii=False)
 
 
 def confirmar_e_envio(service, draft):
+    anexo_bytes = draft.get("anexo_bytes")
+    anexo_nome = draft.get("anexo_nome")
+    anexo_str = f" com o anexo '{anexo_nome}'" if anexo_nome else ""
+
     if draft["acao"] == "enviar":
-        enviar_email(service, draft["dest"], draft["assunto"], draft["corpo"])
-        return f"✅ Pronto! E-mail enviado com sucesso para {draft['dest']} | Assunto: '{draft['assunto']}'.\n\nSe precisar de mais alguma coisa, é só falar! 😊"
+        enviar_email(service, draft["dest"], draft["assunto"], draft["corpo"], anexo_bytes=anexo_bytes, anexo_nome=anexo_nome)
+        return f"✅ Pronto! E-mail enviado com sucesso para {draft['dest']}{anexo_str} | Assunto: '{draft['assunto']}'.\n\nSe precisar de mais alguma coisa, é só falar! 😊"
     if draft["acao"] == "responder":
-        dest, assunto = responder_email(service, draft["msg_id"], draft["corpo"])
-        return f"✅ Resposta enviada com sucesso para {dest} | Assunto: '{assunto}'!\n\nPosso te ajudar com mais algum e-mail?"
+        dest, assunto = responder_email(service, draft["msg_id"], draft["corpo"], anexo_bytes=anexo_bytes, anexo_nome=anexo_nome)
+        return f"✅ Resposta enviada com sucesso para {dest}{anexo_str} | Assunto: '{assunto}'!\n\nPosso te ajudar com mais algum e-mail?"
     return "Nada pendente para envio."
 
 
@@ -418,23 +889,51 @@ async def comando_start(update: Update, context):
         "Olá! Sou o GENNIE, seu assistente de e-mail com IA. 😊\n\n"
         "Pode pedir com palavras simples, por exemplo:\n"
         "📬 \"veja meus emails\"\n"
-        "📥 \"tem email novo?\"\n"
-        "📖 \"leia o email <id>\"\n"
+        "⭐ \"emails com estrela\" ou \"destaque o email <id>\"\n"
+        "📎 \"baixe o anexo do email <id>\"\n"
+        "🏷️ \"coloque a etiqueta Finanças no email <id>\"\n"
+        "🗑️ \"mova o email de propaganda para a lixeira\"\n"
+        "🚫 \"marque este email como spam\"\n"
         "✉️ \"responda o email sobre...\"\n"
         "🆕 \"envie um email para <email>: assunto e mensagem\"\n"
-        "🗄️ \"arquive os emails do banco\""
+        "📎 Ou envie um documento/foto aqui no chat para anexar!\n"
+        "🧹 /limpar - Reseta a memória do diálogo atual"
     )
 
 
 async def processar_mensagem(update: Update, context):
     if not autorizado(update):
         return
-    texto = update.message.text.strip()
+    texto = update.message.text.strip() if update.message.text else ""
+    if not texto:
+        return
+        
     logging.info("Mensagem recebida de %s: '%s'", update.effective_chat.id, texto)
     t = texto.lower()
 
     if not API_KEY:
         await update.message.reply_text("DeepSeek API não configurada.")
+        return
+
+    # Atalho rápido para solicitações de limpeza de memória em linguagem natural
+    termos_limpeza = [
+        "limpar memória", "limpar memoria", "limpa memória", "limpa memoria", "limpe a memória", "limpe a memoria",
+        "resetar memória", "resetar memoria", "resetar", "apagar memória", "apagar memoria", "apague a memória",
+        "apagar histórico", "apagar historico", "apague o histórico", "apague o historico",
+        "limpar histórico", "limpar historico", "limpa o histórico", "limpa o historico",
+        "esquecer tudo", "esquecer conversa", "esqueça tudo", "esqueça a conversa",
+        "limpar contexto", "limpa o contexto", "zerar memória", "zerar memoria", "zere a memória",
+    ]
+    if any(t == termo or t.startswith(termo) for termo in termos_limpeza):
+        context.user_data.clear()
+        msg_confirmacao = (
+            "🧹 *Confirmação de Limpeza de Memória*\n\n"
+            "✅ O histórico de conversas anteriores foi apagado.\n"
+            "✅ Quaisquer rascunhos de e-mail pendentes foram cancelados.\n"
+            "💾 O arquivo de persistência em disco foi atualizado.\n\n"
+            "Tudo pronto para começarmos do zero! Em que posso te ajudar hoje? 😊"
+        )
+        await update.message.reply_text(msg_confirmacao, parse_mode="Markdown")
         return
 
     service = get_gmail_service()
@@ -447,6 +946,7 @@ async def processar_mensagem(update: Update, context):
             except Exception as e:
                 resultado = f"Ops, ocorreu um erro ao enviar o e-mail: {e}"
             context.user_data.pop("draft", None)
+            context.user_data.pop("anexo_pendente", None)
             
             # Mantém histórico para continuidade da conversa
             hist = context.user_data.get("hist", [])
@@ -459,6 +959,7 @@ async def processar_mensagem(update: Update, context):
 
         if "cancelar" in t or "não" in t or "cancela" in t:
             context.user_data.pop("draft", None)
+            context.user_data.pop("anexo_pendente", None)
             msg_cancel = "Sem problemas! O envio foi cancelado. Se precisar de mais alguma coisa, estou por aqui! 😊"
             hist = context.user_data.get("hist", [])
             hist.append({"role": "user", "content": texto})
@@ -473,7 +974,69 @@ async def processar_mensagem(update: Update, context):
     except Exception as e:
         logging.exception("Erro no agente")
         resposta = f"Ops! Ocorreu um erro: {e}"
+    
     await update.message.reply_text(resposta[:4000])
+
+    # Envia arquivo anexo baixado do Gmail diretamente para o chat do Telegram, se houver
+    anexo_tg = context.user_data.pop("anexo_para_enviar_tg", None)
+    if anexo_tg:
+        try:
+            await update.message.reply_document(
+                document=io.BytesIO(anexo_tg["data"]),
+                filename=anexo_tg["filename"],
+                caption=f"📎 Aqui está o arquivo: *{anexo_tg['filename']}*",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logging.exception("Erro ao enviar anexo no Telegram")
+            await update.message.reply_text(f"Baixei o arquivo '{anexo_tg['filename']}', mas houve um erro ao enviar para o Telegram: {e}")
+
+
+async def receber_documento(update: Update, context):
+    if not autorizado(update):
+        return
+    doc = update.message.document
+    photo = update.message.photo
+    caption = update.message.caption or ""
+
+    if doc:
+        file = await doc.get_file()
+        file_bytes = await file.download_as_bytearray()
+        file_name = doc.file_name or "documento.pdf"
+        file_size = len(file_bytes)
+    elif photo:
+        foto = photo[-1]
+        file = await foto.get_file()
+        file_bytes = await file.download_as_bytearray()
+        file_name = f"foto_{update.message.message_id}.jpg"
+        file_size = len(file_bytes)
+    else:
+        return
+
+    context.user_data["anexo_pendente"] = {
+        "nome": file_name,
+        "bytes": bytes(file_bytes),
+        "tamanho": file_size,
+    }
+
+    tam_kb = round(file_size / 1024, 1)
+
+    if caption.strip():
+        await update.message.reply_text(
+            f"📎 *Arquivo `{file_name}` ({tam_kb} KB) recebido!*\nProcessando instruções...",
+            parse_mode="Markdown"
+        )
+        update.message.text = caption
+        await processar_mensagem(update, context)
+    else:
+        await update.message.reply_text(
+            f"📎 *Arquivo recebido com sucesso!*\n\n"
+            f"📄 *Nome:* `{file_name}`\n"
+            f"📊 *Tamanho:* {tam_kb} KB\n\n"
+            f"O que você deseja fazer com este anexo?\n"
+            f"💡 *Exemplo:* \"Envie este arquivo para contato@exemplo.com com o assunto Documento e mensagem Segue em anexo.\"",
+            parse_mode="Markdown"
+        )
 
 
 async def agente_llm(service, user_data, texto):
@@ -524,15 +1087,40 @@ async def erro_global(update: Update, context):
             pass
 
 
+async def comando_limpar(update: Update, context):
+    if not autorizado(update):
+        return
+    context.user_data.clear()
+    msg_confirmacao = (
+        "🧹 *Confirmação de Limpeza de Memória*\n\n"
+        "✅ O histórico de conversas anteriores foi apagado.\n"
+        "✅ Quaisquer rascunhos de e-mail pendentes foram cancelados.\n"
+        "💾 O arquivo de persistência em disco foi atualizado.\n\n"
+        "Tudo pronto para começarmos do zero! Em que posso te ajudar hoje? 😊"
+    )
+    await update.message.reply_text(msg_confirmacao, parse_mode="Markdown")
+
+
+async def comando_briefing(update: Update, context):
+    if not autorizado(update):
+        return
+    update.message.text = "Por favor, elabore um briefing executivo completo e estruturado dos meus e-mails mais recentes."
+    await processar_mensagem(update, context)
+
+
 def main():
     logging.basicConfig(level=logging.INFO)
+    garantir_instancia_unica()
     carregar_env()
     if not TOKEN:
         print("TELEGRAM_TOKEN não configurado. Adicione ao .env ou edite o script.")
         sys.exit(1)
+    
+    persistencia = PicklePersistence(filepath=str(MEMORIA_FILE))
     app = (
         Application.builder()
         .token(TOKEN)
+        .persistence(persistencia)
         .connect_timeout(30)
         .read_timeout(30)
         .write_timeout(30)
@@ -541,9 +1129,12 @@ def main():
     )
     app.add_handler(CommandHandler("start", comando_start))
     app.add_handler(CommandHandler(("help", "ajuda", "comandos"), comando_start))
+    app.add_handler(CommandHandler(("limpar", "reset", "esquecer"), comando_limpar))
+    app.add_handler(CommandHandler(("briefing", "resumo", "resumos"), comando_briefing))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, processar_mensagem))
+    app.add_handler(MessageHandler(filters.Document.ALL | filters.PHOTO, receber_documento))
     app.add_error_handler(erro_global)
-    print(f"GENNIE IA iniciado. Dono: {DONO_ID} | Modelo: {MODEL}")
+    print(f"GENNIE IA iniciado com Persistência Ativa. Dono: {DONO_ID} | Modelo: {MODEL}")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 

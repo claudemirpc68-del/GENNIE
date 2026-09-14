@@ -109,17 +109,28 @@ def autorizado(update: Update):
     return False
 
 
+class GmailAuthExpiredError(Exception):
+    """Exceção disparada quando o token OAuth do Gmail expira ou é revogado."""
+    pass
+
+
 def get_gmail_service():
     creds = None
     if TOKEN_FILE.exists():
-        creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
+        try:
+            creds = Credentials.from_authorized_user_file(str(TOKEN_FILE), SCOPES)
+        except Exception:
+            creds = None
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+            try:
+                creds.refresh(Request())
+                TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
+            except Exception as e:
+                logging.error("Falha ao renovar token OAuth do Gmail: %s", e)
+                raise GmailAuthExpiredError("Token do Gmail expirado ou revogado.") from e
         else:
-            flow = InstalledAppFlow.from_client_secrets_file(str(CLIENT_SECRET), SCOPES)
-            creds = flow.run_local_server(port=0)
-        TOKEN_FILE.write_text(creds.to_json(), encoding="utf-8")
+            raise GmailAuthExpiredError("Credenciais válidas do Gmail não encontradas.")
     return build("gmail", "v1", credentials=creds)
 
 
@@ -985,7 +996,29 @@ async def processar_mensagem(update: Update, context):
         await update.message.reply_text(msg_confirmacao, parse_mode="Markdown")
         return
 
-    service = get_gmail_service()
+    try:
+        service = get_gmail_service()
+    except GmailAuthExpiredError:
+        msg_auth = (
+            "⚠️ *Atenção, Sr. Claudemir: Autorização do Gmail Necessária*
+
+"
+            "As credenciais de acesso ao seu Gmail expiraram ou foram revogadas pelo Google.
+
+"
+            "👉 Para renovar com 1 clique, execute no seu computador o arquivo:
+"
+            "`C:\Users\FAMÍLIA\Desktop\GENNIE_BOT\RENOVAR_GMAIL.bat`
+
+"
+            "Basta fazer o login no navegador e clicar em *Permitir*. Assim que concluir, estarei pronta para ler e gerenciar seus e-mails imediatamente! 🎩✨"
+        )
+        await update.message.reply_text(msg_auth, parse_mode="Markdown")
+        return
+    except Exception as e:
+        logging.exception("Erro ao inicializar serviço do Gmail: %s", e)
+        await update.message.reply_text(f"⚠️ Erro ao conectar ao Gmail: {e}")
+        return
 
     draft = context.user_data.get("draft")
     if draft:

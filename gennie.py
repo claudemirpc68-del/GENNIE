@@ -60,12 +60,11 @@ API_KEY = None
 MODEL = "openai/gpt-oss-120b"
 API_URL = "https://api.groq.com/openai/v1/chat/completions"
 BRIDGE_PORT = 8000
-BRIDGE_SECRET_KEY = "gennie_alfredo_secret_token_2026"
-ALFREDO_API_URL = "http://127.0.0.1:8080"
+BRIDGE_SECRET_KEY = "gennie_bridge_secret_token_2026"
 
 
 def carregar_env():
-    global TOKEN, DONO_ID, API_KEY, MODEL, API_URL, BRIDGE_PORT, BRIDGE_SECRET_KEY, ALFREDO_API_URL
+    global TOKEN, DONO_ID, API_KEY, MODEL, API_URL, BRIDGE_PORT, BRIDGE_SECRET_KEY
     if ENV_FILE.exists():
         for linha in ENV_FILE.read_text(encoding="utf-8").splitlines():
             if linha.startswith("TELEGRAM_TOKEN="):
@@ -99,11 +98,6 @@ def carregar_env():
                 val = linha.split("=", 1)[1].strip()
                 if val:
                     BRIDGE_SECRET_KEY = val
-            elif linha.startswith("ALFREDO_API_URL="):
-                val = linha.split("=", 1)[1].strip()
-                if val:
-                    ALFREDO_API_URL = val
-
 
 def autorizado(update: Update):
     if not update.effective_chat:
@@ -470,8 +464,8 @@ def responder_email(service, msg_id, corpo, anexo_bytes=None, anexo_nome=None):
 
 SYSTEM_PROMPT = f"""Você é GENNIE, assistente pessoal executiva de elite dedicada ao seu desenvolvedor e senhor, Claudemir Pedroso Cubas, atendendo via Telegram.
 
-IDENTIDADE & PERSONALIDADE (Estilo Alfredo — Mordomo Executivo)
-- Persona: Inspirada na sofisticação, cortesia e extrema eficiência de um mordomo executivo de alta classe (estilo Alfredo / Jarvis).
+IDENTIDADE & PERSONALIDADE (Mordomo Executivo de Elite)
+- Persona: Inspirada na sofisticação, cortesia e extrema eficiência de um mordomo executivo de alta classe (estilo Jarvis / Alta Classe).
 - Postura: Altamente respeitosa, polida, solícita e impecavelmente pontual.
 - Tratamento: Trate o Claudemir com deferência cordial ("Sr. Claudemir" ou "senhor").
 - Tom de Voz: Comunicação direta, elegante e sem rodeios. Destaque fatos, métricas e decisões com clareza cristalina.
@@ -487,7 +481,6 @@ COMUNICAÇÃO & RELACIONAMENTO
 ESCOPO DE ATUAÇÃO
 1. Gestão e Curadoria de E-mails (Gmail): Triagem, briefings executivos, respostas com prévia obrigatória e gestão de anexos.
 2. Auditoria e Higienização de Arquivos (Pasta Downloads): Supervisão, interpretação de relatórios e notificação de limpezas realizadas pelo Agente Local de Downloads (especialmente na rotina agendada das 18:00).
-3. Ponte de Orquestração com o BOT ALFREDO: Envio de tarefas, lembretes agendados e artigos para o ecossistema principal.
 
 DIRETRIZES PARA AVISOS DA PASTA DOWNLOADS
 Quando receber dados brutos, logs ou relatórios do Agente de Downloads (ou quando o usuário perguntar sobre downloads):
@@ -519,7 +512,6 @@ CAPACIDADES
 - aplicar_etiqueta: cria, aplica ou remove etiquetas/marcadores customizados em um e-mail.
 - marcar_lido / arquivar: organizam a caixa de entrada.
 - limpar_memoria: limpa o histórico de contexto.
-- enviar_para_alfredo: envia tarefas, lembretes agendados ou textos para o BOT ALFREDO.
 
 ESTRUTURA DE RESPOSTA DO BRIEFING DE E-MAILS
 Ao solicitar briefing ou resumo de mensagens:
@@ -538,7 +530,6 @@ EXEMPLOS DE INTERAÇÃO
   🗑️ **3 arquivos duplicados** eliminados.
   💾 **210 MB de espaço recuperado** em seu armazenamento.
   Tudo devidamente organizado e pronto para uso, senhor."
-- "agende com o Alfredo para pagar o boleto amanhã" → enviar_para_alfredo(tipo="lembrete", ...)
 - "obrigado GENNIE" → "É um privilégio auxiliá-lo, senhor. Se precisar de algo mais, estou sempre à sua total disposição."
 """
 
@@ -744,23 +735,7 @@ TOOLS = [
                 "properties": {},
             },
         },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "enviar_para_alfredo",
-            "description": "Delega ou envia eventos e tarefas para o BOT ALFREDO (ex: agendar lembrete com data/hora, ou enviar notícia/artigo de e-mail para o Alfredo criar um post no LinkedIn).",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "tipo": {"type": "string", "enum": ["lembrete", "linkedin", "tarefa"], "description": "Tipo de ação delegada ao Alfredo."},
-                    "conteudo": {"type": "string", "description": "Texto do lembrete, artigo para post ou dados da tarefa."},
-                    "data_hora": {"type": "string", "description": "Prazo, data ou horário (ex: '2026-09-05 18:00', 'em 2 horas', 'amanhã às 10h')."},
-                },
-                "required": ["tipo", "conteudo"],
-            },
-        },
-    },
+    }
 ]
 
 
@@ -936,34 +911,6 @@ def executar_tool(service, user_data, name, arguments):
         user_data.clear()
         return json.dumps({
             "resultado": "Memória de contexto e rascunhos pendentes limpa com sucesso no sistema. Confirme ao usuário que a memória foi zerada e coloque-se à disposição para um novo assunto."
-        }, ensure_ascii=False)
-
-    if name == "enviar_para_alfredo":
-        tipo = arguments.get("tipo", "lembrete")
-        conteudo = arguments.get("conteudo", "")
-        data_hora = arguments.get("data_hora", "")
-        
-        sucesso_envio = False
-        try:
-            headers = {"Authorization": f"Bearer {BRIDGE_SECRET_KEY}", "Content-Type": "application/json"}
-            payload = {"origem": "GENNIE_BOT", "tipo": tipo, "conteudo": conteudo, "data_hora": data_hora}
-            r = httpx.post(f"{ALFREDO_API_URL}/api/v1/webhook/gennie", json=payload, headers=headers, timeout=3)
-            if r.status_code in (200, 201):
-                sucesso_envio = True
-        except Exception:
-            pass
-
-        if tipo == "lembrete":
-            info_hora = f" (agendado para: {data_hora})" if data_hora else ""
-            msg = f"Lembrete delegado ao ALFREDO com sucesso: '{conteudo}'{info_hora}. Ele cuidará do aviso no Telegram!"
-        elif tipo == "linkedin":
-            msg = f"Conteúdo do e-mail encaminhado para o módulo Ghostwriter do ALFREDO gerar a postagem no LinkedIn."
-        else:
-            msg = f"Ação '{tipo}' delegada ao ALFREDO com sucesso: '{conteudo}'."
-
-        return json.dumps({
-            "resultado": msg,
-            "entregue_via_rede": sucesso_envio
         }, ensure_ascii=False)
 
     return json.dumps({"erro": "Ferramenta desconhecida."}, ensure_ascii=False)
@@ -1211,7 +1158,7 @@ async def comando_briefing(update: Update, context):
 
 
 async def post_init_bridge(application) -> None:
-    """Inicializa o Bridge REST Server assíncrono para o BOT ALFREDO."""
+    """Inicializa o Bridge REST Server assíncrono para integrações externas."""
     try:
         import bridge_server
         await bridge_server.iniciar_servidor_bridge(port=BRIDGE_PORT)

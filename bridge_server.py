@@ -1,10 +1,11 @@
 """
 ====================================================================
-GENNIE BOT - Servidor de Ponte REST (Bridge Server) para o BOT ALFREDO
+GENNIE BOT - Servidor de API REST (Bridge Server)
 ====================================================================
-Expõe uma API HTTP assíncrona leve usando aiohttp.web para que o BOT ALFREDO
-possa consultar e-mails, obter briefings diários, preparar rascunhos e trocar
-eventos de forma segura e com baixa latência.
+Expõe uma API HTTP assíncrona leve usando aiohttp.web para que
+aplicações, automações e dashboards externos possam consultar e-mails,
+obter briefings diários, preparar rascunhos e trocar dados com segurança
+e baixa latência.
 ====================================================================
 """
 
@@ -17,7 +18,6 @@ from pathlib import Path
 from aiohttp import web
 import httpx
 
-# Garante import do gennie caso executado diretamente
 BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
@@ -29,18 +29,15 @@ logger = logging.getLogger("GennieBridge")
 # Variáveis globais da ponte
 BRIDGE_PORT = int(os.environ.get("BRIDGE_PORT", 8000))
 BRIDGE_HOST = os.environ.get("BRIDGE_HOST", "0.0.0.0")
-BRIDGE_SECRET_KEY = os.environ.get("BRIDGE_SECRET_KEY", "gennie_alfredo_secret_token_2026")
-ALFREDO_API_URL = os.environ.get("ALFREDO_API_URL", "http://127.0.0.1:8080")
+BRIDGE_SECRET_KEY = os.environ.get("BRIDGE_SECRET_KEY", "gennie_bridge_secret_token_2026")
 
 
 @web.middleware
 async def autenticacao_middleware(request: web.Request, handler):
     """Valida o cabeçalho Authorization: Bearer <BRIDGE_SECRET_KEY> em rotas protegidas."""
-    # Rotas públicas
     if request.path in ("/health", "/", "/api/v1/status"):
         return await handler(request)
 
-    # Se a rota começa com /api/v1/, exige autenticação
     if request.path.startswith("/api/v1/"):
         auth_header = request.headers.get("Authorization", "")
         token = ""
@@ -68,14 +65,13 @@ async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({
         "status": "online",
         "bot": "GENNIE_BOT",
-        "versao": "1.2.0",
+        "versao": "1.3.0",
         "dono_id": gennie.DONO_ID,
         "conta_email": gennie.CONTA
     })
 
 
 def obter_service_gmail():
-    """Obtém o serviço do Gmail, permitindo override para testes e fallbacks."""
     if hasattr(gennie, "_mock_service_override") and gennie._mock_service_override:
         return gennie._mock_service_override
     return gennie.get_gmail_service()
@@ -133,7 +129,7 @@ async def handle_listar_emails(request: web.Request) -> web.Response:
 
 async def handle_briefing(request: web.Request) -> web.Response:
     """
-    Retorna o briefing estruturado dos e-mails recentes para o Alfredo incluir no /boletim.
+    Retorna o briefing estruturado dos e-mails recentes.
     GET /api/v1/emails/briefing?query=in:inbox is:unread&max_emails=8
     """
     query = request.query.get("query", "in:inbox is:unread")
@@ -146,7 +142,6 @@ async def handle_briefing(request: web.Request) -> web.Response:
         service = obter_service_gmail()
         lote = gennie.obter_lote_para_briefing(service, max_emails=max_emails, query=query)
         
-        # Sintetiza com LLM se solicitado
         gerar_sintese = request.query.get("sintetizar", "true").lower() == "true"
         sintese_texto = ""
         
@@ -195,7 +190,7 @@ async def handle_ler_email(request: web.Request) -> web.Response:
 
 async def handle_preparar_rascunho(request: web.Request) -> web.Response:
     """
-    Prepara uma prévia de e-mail solicitada pelo Alfredo (HITL obrigatório).
+    Prepara uma prévia de e-mail solicitada via API (HITL obrigatório).
     POST /api/v1/emails/preparar
     Body: {"dest": "...", "assunto": "...", "corpo": "..."}
     """
@@ -213,7 +208,7 @@ async def handle_preparar_rascunho(request: web.Request) -> web.Response:
 
     corpo_formatado = gennie.formatar_corpo_com_assinatura(corpo)
     previa = (
-        f"📩 *Prévia do E-mail (Solicitado via Alfredo)*\n\n"
+        f"📩 *Prévia do E-mail (Solicitado via API Externa)*\n\n"
         f"👤 *Para:* `{dest}`\n"
         f"📌 *Assunto:* {assunto}\n\n"
         f"📝 *Mensagem:*\n{corpo_formatado}\n\n"
@@ -232,50 +227,6 @@ async def handle_preparar_rascunho(request: web.Request) -> web.Response:
     })
 
 
-async def handle_delegar_para_alfredo(request: web.Request) -> web.Response:
-    """
-    Endpoint para envio de eventos da GENNIE para o Alfredo (ex: lembretes ou ghostwriting).
-    POST /api/v1/bridge/delegar_alfredo
-    Body: {"tipo": "lembrete" | "linkedin", "conteudo": "...", "data_hora": "..."}
-    """
-    try:
-        dados = await request.json()
-    except Exception:
-        return web.json_response({"sucesso": False, "erro": "Body JSON inválido."}, status=400)
-
-    tipo = dados.get("tipo", "lembrete")
-    conteudo = dados.get("conteudo", "")
-    data_hora = dados.get("data_hora", "")
-
-    headers = {
-        "Authorization": f"Bearer {BRIDGE_SECRET_KEY}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "origem": "GENNIE_BOT",
-        "tipo": tipo,
-        "conteudo": conteudo,
-        "data_hora": data_hora
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(f"{ALFREDO_API_URL}/api/v1/webhook/gennie", json=payload, headers=headers)
-            if resp.status_code in (200, 201):
-                return web.json_response({"sucesso": True, "resposta_alfredo": resp.json()})
-            else:
-                return web.json_response({"sucesso": False, "erro_alfredo": resp.text, "status_code": resp.status_code}, status=502)
-    except Exception as e:
-        logger.warning(f"Não foi possível contatar o Alfredo em {ALFREDO_API_URL}: {e}")
-        return web.json_response({
-            "sucesso": False,
-            "aviso": "Evento registrado localmente, mas o servidor do Alfredo não respondeu no momento.",
-            "detalhe": str(e)
-        }, status=503)
-
-
-# ── Inicialização do Servidor ────────────────────────────────────────────────
-
 def criar_app_bridge() -> web.Application:
     """Cria e configura a aplicação aiohttp com rotas e middlewares."""
     gennie.carregar_env()
@@ -289,7 +240,6 @@ def criar_app_bridge() -> web.Application:
     app.router.add_get("/api/v1/emails/briefing", handle_briefing)
     app.router.add_get("/api/v1/emails/ler", handle_ler_email)
     app.router.add_post("/api/v1/emails/preparar", handle_preparar_rascunho)
-    app.router.add_post("/api/v1/bridge/delegar_alfredo", handle_delegar_para_alfredo)
 
     return app
 

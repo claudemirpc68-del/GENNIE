@@ -53,6 +53,10 @@ Data de Atualização: 29/08/2026
 8. **Controle de Acesso Exclusivo**:
    - Apenas mensagens do `DONO_ID` são processadas.
 
+
+6. **Persona Estilo Alfredo & Integração de Downloads**:
+   - **Nova Persona (Estilo Alfredo / Mordomo Executivo)**: Tratamento cortês e refinado ao Sr. Claudemir Pedroso Cubas, mantendo alta elegância, pontualidade e respostas concisas.
+   - **Supervisão da Pasta Downloads**: Habilidade de interpretar dados brutos do Agente Local de Downloads (agente_downloads.py) e notificar o resumo diário de faxina das 18:00 com métricas de arquivos organizados, duplicados e espaço recuperado.
 ---
 
 ## 📁 4. Arquivos do Projeto

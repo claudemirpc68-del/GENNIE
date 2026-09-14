@@ -1000,17 +1000,10 @@ async def processar_mensagem(update: Update, context):
         service = get_gmail_service()
     except GmailAuthExpiredError:
         msg_auth = (
-            "⚠️ *Atenção, Sr. Claudemir: Autorização do Gmail Necessária*
-
-"
-            "As credenciais de acesso ao seu Gmail expiraram ou foram revogadas pelo Google.
-
-"
-            "👉 Para renovar com 1 clique, execute no seu computador o arquivo:
-"
-            "`C:\Users\FAMÍLIA\Desktop\GENNIE_BOT\RENOVAR_GMAIL.bat`
-
-"
+            "⚠️ *Atenção, Sr. Claudemir: Autorização do Gmail Necessária*\n\n"
+            "As credenciais de acesso ao seu Gmail expiraram ou foram revogadas pelo Google.\n\n"
+            "👉 Para renovar com 1 clique, execute no seu computador o arquivo:\n"
+            "`RENOVAR_GMAIL.bat` (na pasta GENNIE_BOT do Desktop)\n\n"
             "Basta fazer o login no navegador e clicar em *Permitir*. Assim que concluir, estarei pronta para ler e gerenciar seus e-mails imediatamente! 🎩✨"
         )
         await update.message.reply_text(msg_auth, parse_mode="Markdown")
